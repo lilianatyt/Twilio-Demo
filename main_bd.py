@@ -1,11 +1,12 @@
 import asyncio
+import hmac
 import json
 import os
 import time
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from openai import AsyncOpenAI
 from twilio.twiml.voice_response import Connect, VoiceResponse
@@ -295,6 +296,33 @@ async def execute_tool(name: str, args: dict) -> str:
     except httpx.HTTPError:
         return "No se pudo conectar con el sistema de pedidos."
     return r.text
+
+
+# Herramientas de pedidos para Vapi. Usan la misma execute_tool que Twilio.
+VAPI_TOOLS_SECRET = os.getenv("VAPI_TOOLS_SECRET")
+HERRAMIENTAS_VAPI = {"consultar_estatus_pedido", "crear_pedido", "modificar_pedido", "cancelar_pedido"}
+
+
+@app.post("/vapi/herramientas/{nombre}")
+async def herramienta_vapi(nombre: str, request: Request, authorization: str | None = Header(default=None)):
+    if not VAPI_TOOLS_SECRET:
+        raise HTTPException(503, "VAPI_TOOLS_SECRET no está configurado")
+    esperado = f"Bearer {VAPI_TOOLS_SECRET}".encode()
+    if not authorization or not hmac.compare_digest(authorization.encode(), esperado):
+        raise HTTPException(401, "No autorizado")
+    if nombre not in HERRAMIENTAS_VAPI:
+        raise HTTPException(404, "Herramienta desconocida")
+    try:
+        args = await request.json()
+    except ValueError:
+        raise HTTPException(400, "Body inválido")
+    if not isinstance(args, dict):
+        raise HTTPException(400, "Body inválido")
+    inicio = time.perf_counter()
+    resultado = await execute_tool(nombre, args)
+    ms = (time.perf_counter() - inicio) * 1000
+    print(f"[vapi] Tool {nombre}({args}) -> {resultado} ({ms:.0f} ms)")
+    return {"resultado": resultado}
 
 
 PREGUNTA_CIERRE = "¿Le puedo ayudar en algo más?"
