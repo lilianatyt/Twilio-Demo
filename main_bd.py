@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -22,7 +23,7 @@ PEDIDOS_API_URL = os.getenv("PEDIDOS_API_URL", "http://localhost:8001")
 http = httpx.AsyncClient(base_url=PEDIDOS_API_URL, timeout=5.0)
 
 # Cambia esta línea para probar otra configuración. Al guardar, uvicorn se reinicia solo.
-PERFIL = "nova_medio"
+PERFIL = "flux"
 
 PERFILES = {
     # Valores por defecto de Twilio: responde rápido y cualquier sonido lo interrumpe
@@ -93,16 +94,37 @@ async def twiml_endpoint():
     return Response(content=str(response), media_type="text/xml")
 
 
+ESPERA_TRAS_INTERRUPCION = 5
+MENSAJE_NO_ESCUCHE = "Perdón, no le escuché bien. ¿Me lo puede repetir?"
+
+
+async def avisar_si_no_llega_texto(websocket: WebSocket, call_sid: str | None, messages: list[dict]):
+    await asyncio.sleep(ESPERA_TRAS_INTERRUPCION)
+    print(f"[{call_sid}] No llegó texto después de la interrupción")
+    try:
+        await websocket.send_text(
+            json.dumps({"type": "text", "token": MENSAJE_NO_ESCUCHE, "last": True})
+        )
+    except Exception:
+        return
+    messages.append({"role": "assistant", "content": MENSAJE_NO_ESCUCHE})
+    print(f"[{call_sid}] Tito: {MENSAJE_NO_ESCUCHE}")
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     call_sid = None
     messages: list[dict] = []
+    espera: asyncio.Task | None = None
     try:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
             msg_type = data.get("type")
+            if msg_type == "prompt" and espera:
+                espera.cancel()
+                espera = None
             if msg_type == "setup":
                 call_sid = data.get("callSid")
                 print(f"[{call_sid}] Call connected")
@@ -115,24 +137,30 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg_type == "interrupt":
                 spoken = data.get("utteranceUntilInterrupt", "")
                 print(f"[{call_sid}] Interrupted after: '{spoken}'")
-                # Se guarda solo lo que el cliente alcanzó a escuchar
                 if messages and messages[-1]["role"] == "assistant":
                     if spoken:
                         messages[-1]["content"] = spoken
                     else:
                         messages.pop()
+                if espera:
+                    espera.cancel()
+                espera = asyncio.create_task(avisar_si_no_llega_texto(websocket, call_sid, messages))
             elif msg_type == "error":
                 print(f"[{call_sid}] Conversation Relay error: {data.get('description')}")
     except WebSocketDisconnect:
         print(f"[{call_sid}] Call ended")
+    finally:
+        if espera:
+            espera.cancel()
 
 
 SYSTEM_PROMPT = """Eres Tito, el asistente telefónico virtual de Tacos y Tortas TYT, una taquería con servicio a domicilio.
 Ayudas a los clientes con:
 - Estatus de un pedido (usa consultar_estatus_pedido con el número de pedido)
 - Pedidos nuevos (pide el nombre del cliente, la dirección de entrega y lo que quiere ordenar; usa crear_pedido)
-- Cambios de dirección o de productos en un pedido que todavía no sale (usa modificar_pedido)
-- Cancelaciones de un pedido que todavía no sale (usa cancelar_pedido)
+- Cambios de dirección o de productos en un pedido (usa modificar_pedido)
+- Cancelaciones de un pedido (usa cancelar_pedido)
+- Solo se pueden cambiar o cancelar pedidos con estatus recibido o en preparación. Si el estatus es en camino, entregado o cancelado, ya no se puede
 - Menú (tacos de trompo, suadero o bistec a veinte pesos cada uno; tortas de milanesa o de trompo a sesenta y cinco pesos; agua de jamaica o limonada a treinta pesos)
 - Costo de envío (gratis en pedidos de doscientos pesos o más; en pedidos menores cuesta treinta pesos)
 - Tiempo de entrega (entre treinta y cuarenta y cinco minutos)
@@ -148,8 +176,11 @@ Habla de forma natural, como en una llamada telefónica. Sigue estas reglas:
 - No calcules el total tú. Después de crear o modificar un pedido, di el número de pedido dígito por dígito y el total que regresa el sistema
 - Si no puedes ayudar con algo, dilo brevemente y ofrece comunicarlo con un encargado
 - Nunca inventes información que no esté en esta lista
+- Nunca digas que vas a revisar algo sin usar la herramienta en esa misma respuesta. Si ya tienes el dato en la conversación, contesta directamente
 - Si después de uno o dos intercambios el cliente no ha dicho qué necesita, ofrécele brevemente las opciones: consultar un pedido, hacer un pedido nuevo, o cambiar o cancelar un pedido
-- Cuando el cliente diga que es todo o se despida, pregúntale si le puedes ayudar en algo más. Si responde que no, usa terminar_llamada sin decir nada más"""
+- Cuando el cliente diga que es todo o se despida, pregúntale "¿Le puedo ayudar en algo más?"
+- Usa terminar_llamada solo si en tu mensaje anterior le preguntaste si le puedes ayudar en algo más y respondió claramente que no. En ese caso no digas nada más
+- Si lo que dice el cliente no tiene sentido o no está claro, pídele que lo repita"""
 
 PRODUCTOS_MENU = [
     "taco de trompo", "taco de suadero", "taco de bistec",
@@ -266,6 +297,20 @@ async def execute_tool(name: str, args: dict) -> str:
     return r.text
 
 
+PREGUNTA_CIERRE = "¿Le puedo ayudar en algo más?"
+
+
+def es_pregunta_cierre(texto: str) -> bool:
+    return "ayudar en algo más" in texto.lower()
+
+
+def pregunto_cierre(messages: list[dict]) -> bool:
+    for m in reversed(messages):
+        if m["role"] == "assistant" and m.get("content"):
+            return es_pregunta_cierre(m["content"])
+    return False
+
+
 async def stream_response(
     websocket: WebSocket,
     call_sid: str | None,
@@ -283,15 +328,11 @@ async def stream_response(
             tools=TOOLS,
             stream=True,
         )
-        finish_reason = None
         tool_calls_acc: dict[int, dict] = {}
         async for chunk in stream:
-            # El gateway manda al final un chunk sin choices
             if not chunk.choices:
                 continue
-            choice = chunk.choices[0]
-            delta = choice.delta
-            finish_reason = choice.finish_reason or finish_reason
+            delta = chunk.choices[0].delta
             if delta.content:
                 full_response += delta.content
                 await websocket.send_text(
@@ -307,9 +348,19 @@ async def stream_response(
                     if tc.function and tc.function.arguments:
                         entry["arguments"] += tc.function.arguments
 
-        if finish_reason == "tool_calls" and tool_calls_acc:
+        if tool_calls_acc:
             tool_calls = list(tool_calls_acc.values())
             if any(tc["name"] == "terminar_llamada" for tc in tool_calls):
+                if not pregunto_cierre(messages):
+                    print(f"[{call_sid}] terminar_llamada rechazada: Tito no había preguntado si necesita algo más")
+                    if not es_pregunta_cierre(full_response):
+                        token = f" {PREGUNTA_CIERRE}" if full_response else PREGUNTA_CIERRE
+                        await websocket.send_text(
+                            json.dumps({"type": "text", "token": token, "last": False})
+                        )
+                        full_response += token
+                    print(f"[{call_sid}] Tito: {full_response}")
+                    return full_response
                 print(f"[{call_sid}] Tito terminó la llamada")
                 await websocket.send_text(json.dumps({
                     "type": "end",
@@ -318,8 +369,11 @@ async def stream_response(
                 terminada = True
                 return "(llamada terminada)"
 
-            openai_messages.append({
+            if full_response:
+                print(f"[{call_sid}] Tito: {full_response}")
+            nuevos = [{
                 "role": "assistant",
+                "content": full_response or None,
                 "tool_calls": [
                     {
                         "id": tc["id"],
@@ -328,18 +382,20 @@ async def stream_response(
                     }
                     for tc in tool_calls
                 ],
-            })
+            }]
             for tc in tool_calls:
                 args = json.loads(tc["arguments"] or "{}")
                 inicio = time.perf_counter()
                 result = await execute_tool(tc["name"], args)
                 ms = (time.perf_counter() - inicio) * 1000
                 print(f"[{call_sid}] Tool {tc['name']}({args}) -> {result} ({ms:.0f} ms)")
-                openai_messages.append({
+                nuevos.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": result,
                 })
+            messages.extend(nuevos)
+            openai_messages.extend(nuevos)
             full_response = ""
             stream2 = await client.chat.completions.create(
                 model=MODELO,
@@ -358,7 +414,6 @@ async def stream_response(
                         json.dumps({"type": "text", "token": delta.content, "last": False})
                     )
     finally:
-        # Después de "end" la sesión ya está cerrada
         if not terminada:
             await websocket.send_text(json.dumps({"type": "text", "token": "", "last": True}))
     print(f"[{call_sid}] Tito: {full_response}")
